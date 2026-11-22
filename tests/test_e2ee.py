@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import stat
@@ -11,12 +12,14 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from anyio import Path as AsyncPath
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from nio import AsyncClient, AsyncClientConfig
 from nio.crypto import Olm
 from nio.crypto.key_export import decrypt_and_read, encrypt_and_save
 from peewee import OperationalError
 
 from matrix_mcp.config import MatrixMCPConfig
+from matrix_mcp.cross_signing import SecretStorageError
 from matrix_mcp.e2ee import (
     MISSING_ROOM_KEY,
     E2EEUnavailableError,
@@ -24,6 +27,15 @@ from matrix_mcp.e2ee import (
     e2ee_lock_path,
     e2ee_store_path,
     undelivered_devices,
+)
+from matrix_mcp.sas_verification import SasVerification, VerificationCancelledError
+from tests.sas_helpers import InitiatingDevice, signed_device_keys
+from tests.secret_storage_helpers import (
+    encrypt_secret,
+    key_description,
+    pbkdf2_key,
+    recovery_key,
+    unpadded,
 )
 
 if TYPE_CHECKING:
@@ -52,6 +64,12 @@ class CryptoEndpoint:
     invited: list[str] = field(default_factory=list)
     history_visibility: str | None = None
     members_status: int = 200
+    account_data: dict[str, dict[str, Any]] = field(default_factory=dict)
+    self_signing_keys: dict[str, Any] | None = None
+    signature_uploads: list[dict[str, Any]] = field(default_factory=list)
+    long_poll_batches: list[list[dict[str, Any]]] = field(default_factory=list)
+    sent_to_device: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    other_device: Any = None
 
     async def handle(self, request: web.Request) -> web.Response:  # noqa: PLR0911
         body = await request.json() if request.can_read_body else None
@@ -71,7 +89,8 @@ class CryptoEndpoint:
             return self.upload(body)
         if path == "/_matrix/client/v3/sync":
             self.batch += 1
-            events = self.to_device_batches.pop(0) if self.to_device_batches else []
+            queue = self.long_poll_batches if "timeout" in request.query else self.to_device_batches
+            events = queue.pop(0) if queue else []
             rooms: dict[str, Any] = {"join": {ROOM: {}}} if self.sync_lists_room else {}
             return web.json_response(
                 {
@@ -98,13 +117,37 @@ class CryptoEndpoint:
             return web.json_response({"chunk": chunk})
         if path.endswith("/state/m.room.history_visibility") and self.history_visibility:
             return web.json_response({"history_visibility": self.history_visibility})
+        if path == "/_matrix/client/v3/keys/claim":
+            return web.json_response({"one_time_keys": {}, "failures": {}})
+        return self.cross_signing(path, body)
+
+    def cross_signing(self, path: str, body: Any) -> web.Response:
         if path == "/_matrix/client/v3/keys/query":
             devices = {DEVICE: self.device_keys} if self.device_keys else {}
             devices.update(self.other_devices)
-            return web.json_response({"device_keys": {USER: devices}, "failures": {}})
-        if path == "/_matrix/client/v3/keys/claim":
-            return web.json_response({"one_time_keys": {}, "failures": {}})
-        return web.json_response({"errcode": "M_NOT_FOUND"}, status=404)
+            response: dict[str, Any] = {"device_keys": {USER: devices}, "failures": {}}
+            if self.self_signing_keys is not None:
+                response["self_signing_keys"] = {USER: self.self_signing_keys}
+            return web.json_response(response)
+        if path == "/_matrix/client/v3/keys/signatures/upload":
+            assert isinstance(body, dict)
+            self.signature_uploads.append(body)
+            return web.json_response({"failures": {}})
+        if path.startswith("/_matrix/client/v3/sendToDevice/"):
+            assert isinstance(body, dict)
+            event_type = path.split("/")[5]
+            for devices in body["messages"].values():
+                for content in devices.values():
+                    self.sent_to_device.append((event_type, content))
+                    if self.other_device is not None:
+                        self.long_poll_batches.append(self.other_device.answer(event_type, content))
+            return web.json_response({})
+        stored = None
+        if path.startswith(f"/_matrix/client/v3/user/{USER}/account_data/"):
+            stored = self.account_data.get(path.rsplit("/", 1)[1])
+        if stored is None:
+            return web.json_response({"errcode": "M_NOT_FOUND"}, status=404)
+        return web.json_response(stored)
 
     def upload(self, body: dict[str, Any]) -> web.Response:
         if self.upload_status != 200:
@@ -847,3 +890,247 @@ async def test_unusable_lock_file_degrades_reads(
 
     assert result.error is not None
     assert "read-only" in result.error
+
+
+STORAGE_KEY = bytes(range(32))
+STORAGE_KEY_ID = "storagekey"
+SELF_SIGNING_SEED = bytes(range(64, 96))
+
+
+def self_signing_id() -> str:
+    raw = Ed25519PrivateKey.from_private_bytes(SELF_SIGNING_SEED).public_key().public_bytes_raw()
+    return unpadded(raw)
+
+
+def with_secret_storage(
+    endpoint: CryptoEndpoint, passphrase: dict[str, Any] | None = None, key: bytes = STORAGE_KEY
+) -> None:
+    secret = unpadded(SELF_SIGNING_SEED).encode()
+    endpoint.account_data = {
+        "m.secret_storage.default_key": {"key": STORAGE_KEY_ID},
+        f"m.secret_storage.key.{STORAGE_KEY_ID}": key_description(key, passphrase),
+        "m.cross_signing.self_signing": {
+            "encrypted": {
+                STORAGE_KEY_ID: encrypt_secret(
+                    key, "m.cross_signing.self_signing", secret, bytes(16)
+                )
+            }
+        },
+    }
+    endpoint.self_signing_keys = {
+        "user_id": USER,
+        "usage": ["self_signing"],
+        "keys": {f"ed25519:{self_signing_id()}": self_signing_id()},
+    }
+
+
+async def test_verify_signs_this_device_with_the_self_signing_key(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, endpoint = homeserver
+    with_secret_storage(endpoint)
+
+    result = await MatrixE2EE(config, store_path=tmp_path / "store").verify_device(
+        recovery_key=recovery_key(STORAGE_KEY)
+    )
+
+    assert (result.device_id, result.self_signing_key, result.already_signed) == (
+        DEVICE,
+        self_signing_id(),
+        False,
+    )
+    [upload] = endpoint.signature_uploads
+    signed = upload[USER][DEVICE]
+    assert endpoint.device_keys is not None
+    assert signed["keys"] == endpoint.device_keys["keys"]
+    signature = signed["signatures"][USER][f"ed25519:{self_signing_id()}"]
+    unsigned_part = {key: value for key, value in signed.items() if key != "signatures"}
+    Ed25519PrivateKey.from_private_bytes(SELF_SIGNING_SEED).public_key().verify(
+        base64.b64decode(signature + "=="),
+        json.dumps(unsigned_part, separators=(",", ":"), sort_keys=True).encode(),
+    )
+    assert signed["signatures"][USER][f"ed25519:{DEVICE}"]
+
+
+async def test_verify_accepts_the_secret_storage_passphrase(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, endpoint = homeserver
+    params = {"algorithm": "m.pbkdf2", "salt": "salt", "iterations": 1000}
+    with_secret_storage(endpoint, params, pbkdf2_key("correct horse", "salt", 1000))
+
+    result = await MatrixE2EE(config, store_path=tmp_path / "store").verify_device(
+        passphrase="correct horse"
+    )
+
+    assert not result.already_signed
+    assert len(endpoint.signature_uploads) == 1
+
+
+async def test_verify_skips_an_already_signed_device(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, endpoint = homeserver
+    with_secret_storage(endpoint)
+    e2ee = MatrixE2EE(config, store_path=tmp_path / "store")
+    await e2ee.verify_device(recovery_key=recovery_key(STORAGE_KEY))
+    assert endpoint.device_keys is not None
+    endpoint.device_keys = endpoint.signature_uploads[0][USER][DEVICE]
+
+    result = await e2ee.verify_device(recovery_key=recovery_key(STORAGE_KEY))
+
+    assert result.already_signed
+    assert len(endpoint.signature_uploads) == 1
+
+
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        (lambda endpoint: endpoint.account_data.clear(), "no secret storage"),
+        (
+            lambda endpoint: endpoint.account_data.pop("m.cross_signing.self_signing"),
+            "no m.cross_signing.self_signing secret",
+        ),
+        (
+            lambda endpoint: endpoint.self_signing_keys.update(keys={"ed25519:other": "other"}),
+            "not the account's published one",
+        ),
+    ],
+)
+async def test_verify_refuses_without_a_usable_self_signing_key(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint],
+    tmp_path: Path,
+    change: Any,
+    error: str,
+) -> None:
+    config, endpoint = homeserver
+    with_secret_storage(endpoint)
+    change(endpoint)
+
+    with pytest.raises(SecretStorageError, match=error):
+        await MatrixE2EE(config, store_path=tmp_path / "store").verify_device(
+            recovery_key=recovery_key(STORAGE_KEY)
+        )
+
+    assert endpoint.signature_uploads == []
+
+
+async def test_verify_refuses_a_wrong_recovery_key_and_releases_the_store(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, endpoint = homeserver
+    with_secret_storage(endpoint)
+    store = tmp_path / "store"
+
+    with pytest.raises(SecretStorageError, match="Wrong recovery key"):
+        await MatrixE2EE(config, store_path=store).verify_device(
+            recovery_key=recovery_key(bytes(32))
+        )
+
+    assert endpoint.signature_uploads == []
+    await MatrixE2EE(config, store_path=store, lock_timeout=0.1).setup()
+
+
+async def test_verify_needs_exactly_one_credential(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, _endpoint = homeserver
+    e2ee = MatrixE2EE(config, store_path=tmp_path / "store")
+    with pytest.raises(ValueError, match="either"):
+        await e2ee.verify_device()
+    with pytest.raises(ValueError, match="either"):
+        await e2ee.verify_device(recovery_key="key", passphrase="phrase")
+
+
+class ScriptedElement:
+    """Another verified client of the user that verifies this device with emoji."""
+
+    def __init__(self, endpoint: CryptoEndpoint) -> None:
+        self.endpoint = endpoint
+        self.device = InitiatingDevice(USER, "ELEMENT")
+        self.accept: dict[str, Any] = {}
+        endpoint.other_devices["ELEMENT"] = signed_device_keys(USER, "ELEMENT", self.device.account)
+        endpoint.long_poll_batches = [[self.event("request", self.device.request())]]
+
+    def event(self, name: str, content: dict[str, Any]) -> dict[str, Any]:
+        return {"sender": USER, "type": f"m.key.verification.{name}", "content": content}
+
+    def answer(self, event_type: str, content: dict[str, Any]) -> list[dict[str, Any]]:
+        assert self.endpoint.device_keys is not None
+        if event_type == "m.key.verification.ready":
+            return [self.event("start", self.device.start())]
+        if event_type == "m.key.verification.accept":
+            self.accept = content
+            return [self.event("key", self.device.key())]
+        if event_type == "m.key.verification.key":
+            self.device.receive_key(self.accept, content, DEVICE)
+            return [self.event("mac", self.device.mac(DEVICE))]
+        if event_type == "m.key.verification.mac":
+            our_key = self.endpoint.device_keys["keys"][f"ed25519:{DEVICE}"]
+            self.device.check_mac(content, DEVICE, our_key)
+            return [self.event("done", {"transaction_id": self.device.transaction_id})]
+        if event_type == "m.key.verification.done":
+            self.endpoint.self_signing_keys = {"keys": {"ed25519:SSK": "SSK"}}
+            self.endpoint.device_keys["signatures"][USER]["ed25519:SSK"] = "signature"
+        return []
+
+
+async def test_emoji_verification_with_another_device_gets_this_device_signed(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, endpoint = homeserver
+    endpoint.other_device = ScriptedElement(endpoint)
+    shown: list[list[tuple[str, str]]] = []
+
+    async def confirm(verification: SasVerification) -> bool:
+        shown.append(verification.emoji)
+        return True
+
+    result = await MatrixE2EE(config, store_path=tmp_path / "store").verify_with_device(
+        confirm, lambda _message: None, max_wait=5
+    )
+
+    assert (result.verified_by, result.signed) == ("ELEMENT", True)
+    assert len(shown) == 1
+    assert len(shown[0]) == 7
+    assert [event_type for event_type, _content in endpoint.sent_to_device] == [
+        "m.key.verification.ready",
+        "m.key.verification.accept",
+        "m.key.verification.key",
+        "m.key.verification.mac",
+        "m.key.verification.done",
+    ]
+
+
+async def test_rejected_emoji_cancel_the_verification(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, endpoint = homeserver
+    endpoint.other_device = ScriptedElement(endpoint)
+
+    async def reject(_verification: SasVerification) -> bool:
+        return False
+
+    with pytest.raises(VerificationCancelledError, match="did not match"):
+        await MatrixE2EE(config, store_path=tmp_path / "store").verify_with_device(
+            reject, lambda _message: None, max_wait=5
+        )
+
+    event_type, content = endpoint.sent_to_device[-1]
+    assert event_type == "m.key.verification.cancel"
+    assert content["code"] == "m.mismatched_sas"
+    assert "m.key.verification.mac" not in [sent for sent, _content in endpoint.sent_to_device]
+
+
+async def test_emoji_verification_gives_up_without_a_request(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, _endpoint = homeserver
+
+    async def confirm(_verification: SasVerification) -> bool:
+        return True
+
+    with pytest.raises(RuntimeError, match="in time"):
+        await MatrixE2EE(config, store_path=tmp_path / "store").verify_with_device(
+            confirm, lambda _message: None, max_wait=0.5
+        )

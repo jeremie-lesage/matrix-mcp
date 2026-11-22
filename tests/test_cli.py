@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 import typer
@@ -14,8 +14,19 @@ from matrix_mcp import cli
 from matrix_mcp.auth import LoginResult
 from matrix_mcp.cli import _with_cloudflare_access_header_command, app
 from matrix_mcp.config import MatrixMCPConfig
-from matrix_mcp.e2ee import E2EEStatus, E2EEUnavailableError, e2ee_lock_path, e2ee_store_path
+from matrix_mcp.cross_signing import SecretStorageError
+from matrix_mcp.e2ee import (
+    DeviceVerification,
+    E2EEStatus,
+    E2EEUnavailableError,
+    InteractiveVerification,
+    e2ee_lock_path,
+    e2ee_store_path,
+)
 from matrix_mcp.http_headers import HTTPHeaderConfig
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 
 class FakeE2EE:
@@ -43,6 +54,26 @@ class FakeE2EE:
             msg = "Could not import room keys: wrong passphrase or invalid key export file"
             raise ValueError(msg)
         self.imported = (path, passphrase)
+
+    async def verify_device(self, **credentials: str) -> DeviceVerification:
+        if "right" not in credentials.values():
+            msg = "Wrong recovery key or passphrase"
+            raise SecretStorageError(msg)
+        self.verified_with = credentials
+        assert self.config.device_id is not None
+        return DeviceVerification(self.config.device_id, "SSK", already_signed=False)
+
+    async def verify_with_device(
+        self,
+        confirm: Callable[[Any], Awaitable[bool]],
+        notify: Callable[[str], None],
+    ) -> InteractiveVerification:
+        notify("Verification requested by device ELEMENT")
+        emoji = [("🐶", "Dog"), ("🐱", "Cat")]
+        if not await confirm(SimpleNamespace(emoji=emoji, decimals=(1, 2, 3))):
+            msg = "The emoji did not match"
+            raise RuntimeError(msg)
+        return InteractiveVerification("ELEMENT", signed=True)
 
 
 @pytest.fixture(autouse=True)
@@ -763,6 +794,53 @@ def test_e2ee_import_keys_uses_prompted_passphrase(
         assert "wrong passphrase" in result.output
 
 
+@pytest.mark.parametrize(
+    ("arguments", "credential", "secret", "exit_code"),
+    [
+        ([], "recovery_key", "right", 0),
+        (["--passphrase"], "passphrase", "right", 0),
+        ([], "recovery_key", "wrong", 1),
+    ],
+)
+def test_e2ee_verify_uses_the_prompted_secret(
+    tmp_path: Path, arguments: list[str], credential: str, secret: str, exit_code: int
+) -> None:
+    config = tmp_path / "config.json"
+    write_config(config)
+
+    result = CliRunner().invoke(
+        app, ["e2ee", "verify", *arguments, "--config", str(config)], input=f"{secret}\n"
+    )
+
+    assert result.exit_code == exit_code
+    assert secret not in result.output
+    if exit_code == 0:
+        assert FakeE2EE.instances[0].verified_with == {credential: "right"}
+        assert "Verified device TESTDEVICE with self-signing key SSK" in result.output
+    else:
+        assert "Wrong recovery key" in result.output
+
+
+@pytest.mark.parametrize(("answer", "exit_code"), [("y", 0), ("n", 1)])
+def test_e2ee_verify_with_emoji_asks_the_user_to_compare(
+    tmp_path: Path, answer: str, exit_code: int
+) -> None:
+    config = tmp_path / "config.json"
+    write_config(config)
+
+    result = CliRunner().invoke(
+        app, ["e2ee", "verify", "--emoji", "--config", str(config)], input=f"{answer}\n"
+    )
+
+    assert result.exit_code == exit_code
+    assert "🐶 Dog  🐱 Cat" in result.output
+    assert "1 2 3" in result.output
+    if exit_code == 0:
+        assert "Device TESTDEVICE verified by device ELEMENT" in result.output
+    else:
+        assert "did not match" in result.output
+
+
 def test_auth_logout_removes_the_device_encryption_store(tmp_path: Path) -> None:
     config = tmp_path / "config.json"
     store = e2ee_store_path(write_config(config))
@@ -795,7 +873,7 @@ def test_auth_logout_waits_for_the_encryption_store_lock(
     assert store.exists()
 
 
-@pytest.mark.parametrize("command", ["setup", "import-keys"])
+@pytest.mark.parametrize("command", ["setup", "import-keys", "verify"])
 def test_e2ee_commands_explain_missing_credentials(tmp_path: Path, command: str) -> None:
     export = tmp_path / "keys.txt"
     export.write_text("export", encoding="utf-8")
