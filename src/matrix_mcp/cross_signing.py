@@ -8,8 +8,9 @@ import hmac
 import json
 from typing import Any
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
@@ -20,6 +21,7 @@ _RECOVERY_KEY_PREFIX = b"\x8b\x01"
 _RECOVERY_KEY_LENGTH = 35
 _BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _KEY_BYTES = 32
+_MAX_PBKDF2_ITERATIONS = 10_000_000
 
 
 class SecretStorageError(ValueError):
@@ -52,12 +54,17 @@ def passphrase_key(passphrase: str, key_description: dict[str, Any]) -> bytes:
         msg = "This secret storage key has no passphrase; use the recovery key"
         raise SecretStorageError(msg)
     salt, iterations = params.get("salt"), params.get("iterations")
-    bits = params.get("bits", 256)
-    if not isinstance(salt, str) or not isinstance(iterations, int) or not isinstance(bits, int):
+    bits = params.get("bits", 8 * _KEY_BYTES)
+    if (
+        not isinstance(salt, str)
+        or not isinstance(iterations, int)
+        or not 0 < iterations <= _MAX_PBKDF2_ITERATIONS
+        or bits != 8 * _KEY_BYTES
+    ):
         msg = "The secret storage key has invalid passphrase parameters"
         raise SecretStorageError(msg)
     return hashlib.pbkdf2_hmac(
-        "sha512", passphrase.encode(), salt.encode(), iterations, dklen=bits // 8
+        "sha512", passphrase.encode(), salt.encode(), iterations, dklen=_KEY_BYTES
     )
 
 
@@ -86,7 +93,7 @@ def decrypt_secret(key: bytes, name: str, encrypted: dict[str, Any]) -> str:
         raise SecretStorageError(msg) from exc
     aes_key, mac_key = _derive_keys(key, name)
     if not hmac.compare_digest(hmac.digest(mac_key, ciphertext, "sha256"), mac):
-        msg = f"The stored {name} secret failed its integrity check"
+        msg = f"Wrong recovery key or passphrase, or the stored {name} secret is damaged"
         raise SecretStorageError(msg)
     decryptor = Cipher(algorithms.AES(aes_key), modes.CTR(iv)).decryptor()
     plaintext = decryptor.update(ciphertext) + decryptor.finalize()
@@ -128,6 +135,23 @@ def sign_json(obj: dict[str, Any], key: Ed25519PrivateKey, user_id: str) -> dict
         f"ed25519:{public_key(key)}": signature,
     }
     return {**signed_part, "signatures": signatures}
+
+
+def signature_is_valid(obj: dict[str, Any], user_id: str, key: str) -> bool:
+    """Whether the object carries a valid signature from the user's Ed25519 public key."""
+    signature = (obj.get("signatures") or {}).get(user_id, {}).get(f"ed25519:{key}")
+    if not isinstance(signature, str):
+        return False
+    signed_part = {
+        name: value for name, value in obj.items() if name not in ("signatures", "unsigned")
+    }
+    try:
+        Ed25519PublicKey.from_public_bytes(_unpadded_b64decode(key)).verify(
+            _unpadded_b64decode(signature), canonical_json(signed_part)
+        )
+    except (InvalidSignature, ValueError):
+        return False
+    return True
 
 
 def canonical_json(obj: dict[str, Any]) -> bytes:

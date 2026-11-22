@@ -25,6 +25,7 @@ _NOTHING_TO_CONFIRM = ("m.unexpected_message", "No emoji to confirm yet")
 _MISSING_DEVICE_MAC = ("m.key_mismatch", "The device key was not confirmed")
 _KEY_MISMATCH = ("m.key_mismatch", "Mismatched device keys")
 MISMATCHED_SAS = ("m.mismatched_sas", "The emoji did not match")
+UNEXPECTED_MESSAGE = ("m.unexpected_message", "Unexpected verification message")
 
 
 class VerificationCancelledError(RuntimeError):
@@ -57,6 +58,7 @@ class SasVerification:
         self.transaction_id = transaction_id
         self._sas: vodozemac.Sas | None = vodozemac.Sas()
         self._public_key = self._sas.public_key.to_base64()
+        self._accepted = False
         self._established: Any = None
         self._their_mac: dict[str, Any] | None = None
         self.emoji: list[tuple[str, str]] = []
@@ -73,7 +75,7 @@ class SasVerification:
 
     def receive_start(self, content: dict[str, Any]) -> dict[str, Any]:
         """Answer the other device's start with our accept message."""
-        if self._sas is None or self.emoji:
+        if self._accepted:
             raise VerificationCancelledError(*_UNEXPECTED_START)
         if (
             content.get("method") != SAS_METHOD
@@ -90,6 +92,7 @@ class SasVerification:
         ):
             raise VerificationCancelledError(*_UNKNOWN_METHOD)
         commitment = hashlib.sha256((self._public_key + canonical_json(content).decode()).encode())
+        self._accepted = True
         return {
             "transaction_id": self.transaction_id,
             "key_agreement_protocol": _KEY_AGREEMENT,
@@ -102,7 +105,7 @@ class SasVerification:
     def receive_key(self, content: dict[str, Any]) -> dict[str, Any]:
         """Derive the short authentication string and answer with our public key."""
         their_key = content.get("key")
-        if self._sas is None or not isinstance(their_key, str):
+        if not self._accepted or self._sas is None or not isinstance(their_key, str):
             raise VerificationCancelledError(*_UNEXPECTED_KEY)
         sas, self._sas = self._sas, None
         try:
