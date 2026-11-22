@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import base64
 import json
+from typing import TYPE_CHECKING
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from matrix_mcp.cross_signing import (
     SecretStorageError,
@@ -35,9 +39,9 @@ def test_recovery_key_decodes_with_or_without_spaces() -> None:
 
 
 @pytest.mark.parametrize("mangle", [lambda text: text[:-1], lambda text: text.replace("1", "2")])
-def test_mistyped_recovery_key_is_refused(mangle: object) -> None:
+def test_mistyped_recovery_key_is_refused(mangle: Callable[[str], str]) -> None:
     text = recovery_key(KEY)
-    mangled = mangle(text)  # type: ignore[operator]
+    mangled = mangle(text)
     assert mangled != text
     with pytest.raises(SecretStorageError):
         decode_recovery_key(mangled)
