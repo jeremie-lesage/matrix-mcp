@@ -18,6 +18,7 @@ from matrix_mcp.cross_signing import (
     passphrase_key,
     public_key,
     sign_json,
+    signature_is_valid,
     signing_key,
 )
 from tests.secret_storage_helpers import (
@@ -76,7 +77,7 @@ def test_passphrase_derives_the_storage_key() -> None:
 def test_secret_decrypts_and_detects_tampering() -> None:
     encrypted = encrypt_secret(KEY, "m.cross_signing.self_signing", b"secret", bytes(16))
     assert decrypt_secret(KEY, "m.cross_signing.self_signing", encrypted) == "secret"
-    with pytest.raises(SecretStorageError, match="integrity"):
+    with pytest.raises(SecretStorageError, match="is damaged"):
         decrypt_secret(KEY, "m.cross_signing.master", encrypted)
     with pytest.raises(SecretStorageError, match="malformed"):
         decrypt_secret(KEY, "m.cross_signing.self_signing", {"iv": encrypted["iv"]})
@@ -113,3 +114,39 @@ def test_signature_covers_the_canonical_object_and_keeps_other_signatures() -> N
     ).encode()
     verifier = Ed25519PublicKey.from_public_bytes(key.public_key().public_bytes_raw())
     verifier.verify(base64.b64decode(signature + "=="), canonical)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"iterations": 10**12}, {"iterations": 0}, {"bits": 2**40}, {"bits": 512}],
+)
+def test_passphrase_parameters_out_of_bounds_are_refused(change: dict[str, int]) -> None:
+    params = {"algorithm": "m.pbkdf2", "salt": "salt", "iterations": 1000, **change}
+
+    with pytest.raises(SecretStorageError, match="invalid passphrase parameters"):
+        passphrase_key("correct horse", {"passphrase": params})
+
+
+def test_wrong_key_without_a_key_check_is_reported_as_such() -> None:
+    description = {"algorithm": key_description(KEY)["algorithm"]}
+    other = bytes(32)
+    check_key(other, description)
+    encrypted = encrypt_secret(KEY, "m.cross_signing.self_signing", b"secret", bytes(16))
+
+    with pytest.raises(SecretStorageError, match="Wrong recovery key or passphrase"):
+        decrypt_secret(other, "m.cross_signing.self_signing", encrypted)
+
+
+def test_signature_check_accepts_only_a_valid_signature() -> None:
+    key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    device = {"user_id": USER, "device_id": "DEVICE", "keys": {"ed25519:DEVICE": "abc"}}
+    signed = sign_json(device, key, USER)
+    key_id = f"ed25519:{public_key(key)}"
+
+    assert signature_is_valid(signed, USER, public_key(key))
+    assert not signature_is_valid(device, USER, public_key(key))
+    assert not signature_is_valid({**signed, "device_id": "OTHER"}, USER, public_key(key))
+    forged = {**signed, "signatures": {USER: {key_id: unpadded(bytes(64))}}}
+    assert not signature_is_valid(forged, USER, public_key(key))
+    malformed = {**signed, "signatures": {USER: {key_id: "not base64!"}}}
+    assert not signature_is_valid(malformed, USER, public_key(key))

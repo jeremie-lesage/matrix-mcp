@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shlex
 import shutil
 import subprocess
+import threading
 import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -13,7 +15,7 @@ import typer
 
 if TYPE_CHECKING:
     from matrix_mcp.config import MatrixMCPConfig
-    from matrix_mcp.e2ee import E2EEStatus, MatrixE2EE
+    from matrix_mcp.e2ee import E2EEStatus
     from matrix_mcp.http_headers import HTTPHeaderConfig
     from matrix_mcp.sas_verification import SasVerification
 
@@ -400,7 +402,7 @@ def e2ee_verify(
 
     settings = _load_credentials(config)
     if emoji:
-        _verify_with_emoji(MatrixE2EE(settings), settings)
+        _verify_with_emoji(settings)
         return
     secret = typer.prompt(
         "Secret storage passphrase" if use_passphrase else "Recovery key", hide_input=True
@@ -419,14 +421,14 @@ def e2ee_verify(
     )
 
 
-def _verify_with_emoji(e2ee: MatrixE2EE, settings: MatrixMCPConfig) -> None:
+def _verify_with_emoji(settings: MatrixMCPConfig) -> None:
+    from matrix_mcp.e2ee import MatrixE2EE
+
     async def confirm(verification: SasVerification) -> bool:
         typer.echo("  ".join(f"{symbol} {name}" for symbol, name in verification.emoji))
         if verification.decimals is not None:
             typer.echo(" ".join(str(number) for number in verification.decimals))
-        return await asyncio.to_thread(
-            typer.confirm, "Does the other device show the same emoji, in the same order?"
-        )
+        return await _ask("Does the other device show the same emoji, in the same order?")
 
     typer.echo(
         f"Waiting for a verification request for device {settings.device_id}. In another "
@@ -434,7 +436,7 @@ def _verify_with_emoji(e2ee: MatrixE2EE, settings: MatrixMCPConfig) -> None:
         "choose Verify."
     )
     try:
-        result = asyncio.run(e2ee.verify_with_device(confirm, typer.echo))
+        result = asyncio.run(MatrixE2EE(settings).verify_with_device(confirm, typer.echo))
     except (RuntimeError, ValueError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from exc
@@ -445,6 +447,31 @@ def _verify_with_emoji(e2ee: MatrixE2EE, settings: MatrixMCPConfig) -> None:
         )
         return
     typer.echo(f"Device {settings.device_id} verified by device {result.verified_by}")
+
+
+async def _ask(question: str) -> bool:
+    loop = asyncio.get_running_loop()
+    answer: asyncio.Future[bool] = loop.create_future()
+
+    def settle(result: bool | None, error: BaseException | None) -> None:
+        if answer.done():
+            return
+        if error is not None:
+            answer.set_exception(error)
+            return
+        answer.set_result(bool(result))
+
+    def ask() -> None:
+        try:
+            result: bool | None = typer.confirm(question)
+            error: BaseException | None = None
+        except Exception as exc:  # noqa: BLE001
+            result, error = None, exc
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(settle, result, error)
+
+    threading.Thread(target=ask, daemon=True).start()
+    return await answer
 
 
 def _setup_e2ee(config: MatrixMCPConfig) -> None:

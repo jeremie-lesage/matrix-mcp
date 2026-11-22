@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import subprocess
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -885,3 +888,39 @@ def test_e2ee_commands_explain_missing_credentials(tmp_path: Path, command: str)
 
     assert result.exit_code == 1
     assert "Cannot read Matrix MCP credentials" in result.output
+
+
+def test_e2ee_verify_with_emoji_reports_unusable_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "config.json"
+    write_config(config)
+
+    def unusable(_config: MatrixMCPConfig) -> None:
+        msg = "End-to-end encryption needs a Matrix user, device ID, and access token"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr("matrix_mcp.e2ee.MatrixE2EE", unusable)
+
+    result = CliRunner().invoke(app, ["e2ee", "verify", "--emoji", "--config", str(config)])
+
+    assert result.exit_code == 1
+    assert "needs a Matrix user, device ID, and access token" in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+def test_emoji_prompt_does_not_outlive_the_verification(monkeypatch: pytest.MonkeyPatch) -> None:
+    answered = threading.Event()
+    monkeypatch.setattr("typer.confirm", lambda _question: answered.wait(5))
+    started = time.monotonic()
+
+    async def give_up() -> None:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(cli._ask("Same emoji?"), 0.1)  # noqa: SLF001
+
+    try:
+        asyncio.run(give_up())
+    finally:
+        answered.set()
+
+    assert time.monotonic() - started < 2

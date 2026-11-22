@@ -103,3 +103,15 @@ def test_messages_out_of_order_cancel() -> None:
         verification.receive_key(other.key())
     with pytest.raises(VerificationCancelledError):
         verification.receive_start(other.start())
+
+
+def test_key_before_the_start_is_refused_and_the_start_still_works() -> None:
+    other = InitiatingDevice(USER, "ELEMENT")
+    verification = responder(other)
+
+    with pytest.raises(VerificationCancelledError) as cancelled:
+        verification.receive_key(other.key())
+
+    assert cancelled.value.code == "m.unexpected_message"
+    assert not verification.emoji
+    verification.receive_start(other.start())
